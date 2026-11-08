@@ -1,0 +1,114 @@
+name: Deploy Portfolio
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+  ECR_REGISTRY: 491085392395.dkr.ecr.us-east-1.amazonaws.com
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  deploy:
+    name: Build and Deploy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate application build
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build application
+        run: npm run build
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Docker image
+        run: |
+          docker build -t "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" .
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+
+      - name: Configure SSH
+        env:
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+          EC2_KNOWN_HOSTS: ${{ secrets.EC2_KNOWN_HOSTS }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+
+          printf '%s\n' "$EC2_SSH_KEY" > ~/.ssh/portfolio_key
+          chmod 600 ~/.ssh/portfolio_key
+
+          printf '%s\n' "$EC2_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Deploy to EC2
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+        run: |
+          ssh -i ~/.ssh/portfolio_key \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            "$EC2_USER@$EC2_HOST" \
+            "IMAGE_URI='$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG' AWS_REGION='$AWS_REGION' bash -s" <<'REMOTE'
+
+          set -e
+
+          echo "Authenticating with Amazon ECR..."
+
+          aws ecr get-login-password --region "$AWS_REGION" |
+            sudo docker login \
+              --username AWS \
+              --password-stdin \
+              491085392395.dkr.ecr.us-east-1.amazonaws.com
+
+          echo "Pulling image: $IMAGE_URI"
+          sudo docker pull "$IMAGE_URI"
+
+          echo "Replacing existing portfolio container..."
+          sudo docker rm -f portfolio || true
+
+          echo "Starting portfolio..."
+          sudo docker run -d \
+            --name portfolio \
+            --restart unless-stopped \
+            -p 80:80 \
+            "$IMAGE_URI"
+
+          REMOTE
+
+      - name: Verify public deployment
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+        run: |
+          echo "Checking portfolio at http://$EC2_HOST"
+
+          curl --fail \
+            --retry 10 \
+            --retry-delay 5 \
+            --retry-connrefused \
+            "http://$EC2_HOST/"
