@@ -1,4 +1,9 @@
 import './style.css';
+import resumePdfUrl from '../John_Frontend_Resume.pdf?url';
+
+document.querySelectorAll<HTMLAnchorElement>('[data-cv-download]').forEach((link) => {
+  link.href = resumePdfUrl;
+});
 
 type LayerId = 1 | 2 | 3;
 
